@@ -403,3 +403,12 @@ echo 'close' | socat - tcp:target_ip:80
 ## 许可证
 
 本项目仅供教育和授权测试使用。使用者须遵守当地法律法规。
+
+C2 配置动态获取：从 DNS TXT、HTTP header、SNI、DoH 等读取真实C2
+内存加载payload：避免写盘，使用 memfd_create + fexecve
+使用io_uring：网络/文件操作绕过部分syscall hook（RingReaper风格）
+rootkit级别隐藏：隐藏文件、进程、网络连接（需要LKM或eBPF）
+环境感知：检测EDR进程、沙箱、虚拟机、honeypot特征
+自销毁/休眠：检测到调查行为后自删除或长时间sleep
+
+
